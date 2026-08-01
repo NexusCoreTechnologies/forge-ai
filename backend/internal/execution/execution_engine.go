@@ -1,6 +1,8 @@
 package execution
 
 import (
+    "encoding/json"
+    "errors"
     "fmt"
     "os"
     "path/filepath"
@@ -14,6 +16,7 @@ import (
     "forgeai/backend/internal/prompt"
     "forgeai/backend/internal/providers/factory"
     providersModels "forgeai/backend/internal/providers/models"
+    openaiProvider "forgeai/backend/internal/providers/openai"
     "forgeai/backend/internal/reports"
     "forgeai/backend/internal/workspace"
 )
@@ -36,39 +39,39 @@ func (e *ExecutionEngine) Execute(project string, promptName string) (*models.Ex
     id := uuid.New().String()
     logs := []string{}
     warnings := []string{}
-    errors := []string{}
+    errorList := []string{}
 
     e.logger.Info("execution.start", map[string]any{"executionId": id, "project": project, "prompt": promptName})
     logs = append(logs, "execution started")
 
     if err := e.workspaceManager.OpenWorkspace(e.config.Workspace); err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
     }
 
     if err := e.workspaceManager.ValidateWorkspace(); err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
     }
     logs = append(logs, "workspace validated")
 
     prompt, err := e.promptLoader.ReadPrompt(promptName)
     if err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
     }
     logs = append(logs, "prompt loaded")
 
     if err := e.promptLoader.ValidatePrompt(prompt); err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
     }
     logs = append(logs, "prompt validated")
 
     generatedDir := filepath.Join(e.config.Workspace, "generated")
     if err := filesystem.Create(generatedDir); err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
     }
 
     // Instantiate provider (environment overrides configuration)
@@ -78,14 +81,81 @@ func (e *ExecutionEngine) Execute(project string, promptName string) (*models.Ex
     }
     prov, err := factory.NewProvider(providerName, &providersModels.Config{APIKeyEnv: "OPENAI_API_KEY"})
     if err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
     }
 
-    resp, err := prov.Generate(prompt.Content)
+    // Validate provider configuration (API key presence etc.)
+    if verr := prov.ValidateConfiguration(); verr != nil {
+        errorList = append(errorList, verr.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), verr
+    }
+
+    // Read execution context and plan if present and include them in the prompt sent to provider
+    contextPath := filepath.Join(e.config.Workspace, "execution_context.json")
+    planPath := filepath.Join(e.config.Workspace, "execution_plan.json")
+    contextStr := "(no execution_context.json)"
+    planStr := "(no execution_plan.json)"
+    if b, err := os.ReadFile(contextPath); err == nil {
+        contextStr = string(b)
+    }
+    if b, err := os.ReadFile(planPath); err == nil {
+        planStr = string(b)
+    }
+
+    compositePrompt := fmt.Sprintf("Execution Context:\n%s\n\nExecution Plan:\n%s\n\nPrompt:\n%s", contextStr, planStr, prompt.Content)
+
+    provInfo := prov.ProviderInfo()
+    e.logger.Info("provider.invoke.start", map[string]any{"provider": provInfo.Name, "model": provInfo.Model, "executionId": id})
+    providerStart := time.Now()
+    resp, err := prov.Generate(compositePrompt)
+    providerDuration := time.Since(providerStart)
     if err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        result := map[string]any{
+            "provider": provInfo.Name,
+            "model": provInfo.Model,
+            "prompt": prompt.Name,
+            "tokens": 0,
+            "execution_time_seconds": providerDuration.Seconds(),
+            "status": "failed",
+            "error_code": "",
+            "retryable": false,
+        }
+        var quotaErr *openaiProvider.QuotaError
+        if errors.As(err, &quotaErr) {
+            result["error_code"] = quotaErr.Code
+            result["retryable"] = false
+        }
+        if rb, marshalErr := json.MarshalIndent(result, "", "  "); marshalErr == nil {
+            _ = os.WriteFile(filepath.Join(generatedDir, fmt.Sprintf("execution_result_%s.json", id)), rb, 0o644)
+        }
+        errorList = append(errorList, err.Error())
+        e.logger.Error("provider.invoke.failed", map[string]any{"error": err.Error(), "provider": provInfo.Name, "executionId": id})
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
+    }
+    e.logger.Info("provider.invoke.completed", map[string]any{"provider": provInfo.Name, "model": provInfo.Model, "executionId": id, "tokens": resp.Tokens, "latency_ms": providerDuration.Milliseconds()})
+
+    // Save response to generated/response.md
+    responsePath := filepath.Join(generatedDir, "response.md")
+    if err := filesystem.Write(responsePath, []byte(resp.Text)); err != nil {
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
+    }
+
+    // Write execution_result.json into generated
+    result := map[string]any{
+        "provider": provInfo.Name,
+        "model": provInfo.Model,
+        "prompt": prompt.Name,
+        "tokens": resp.Tokens,
+        "execution_time_seconds": providerDuration.Seconds(),
+        "status": "completed",
+    }
+    // cost is provider-specific and may not be available
+    _ = result
+    resultPath := filepath.Join(generatedDir, fmt.Sprintf("execution_result_%s.json", id))
+    if rb, err := json.MarshalIndent(result, "", "  "); err == nil {
+        _ = os.WriteFile(resultPath, rb, 0o644)
     }
 
     outputPath := filepath.Join(generatedDir, fmt.Sprintf("%s.execution.md", prompt.Name))
@@ -102,16 +172,16 @@ Response:
 %s
 `, prompt.Name, project, prompt.Content, resp.Text)
     if err := filesystem.Write(outputPath, []byte(outputContent)); err != nil {
-        errors = append(errors, err.Error())
-        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errors), err
+        errorList = append(errorList, err.Error())
+        return e.finishReport(id, project, promptName, start, "failed", logs, warnings, errorList), err
     }
     logs = append(logs, "generated execution artifact")
 
-    report := e.finishReport(id, project, promptName, start, "completed", logs, warnings, errors)
+    report := e.finishReport(id, project, promptName, start, "completed", logs, warnings, errorList)
     if err := e.reportManager.SaveExecutionReport(report); err != nil {
-        errors = append(errors, err.Error())
+        errorList = append(errorList, err.Error())
         report.Status = "failed"
-        report.Errors = errors
+        report.Errors = errorList
         e.logger.Error("report save failed", map[string]any{"error": err.Error()})
         return report, err
     }
@@ -121,7 +191,7 @@ Response:
     return report, nil
 }
 
-func (e *ExecutionEngine) finishReport(id, project, promptName string, start time.Time, status string, logs, warnings, errors []string) *models.ExecutionReport {
+func (e *ExecutionEngine) finishReport(id, project, promptName string, start time.Time, status string, logs, warnings, errorMessages []string) *models.ExecutionReport {
     end := time.Now()
     return &models.ExecutionReport{
         ExecutionID:    id,
@@ -131,7 +201,7 @@ func (e *ExecutionEngine) finishReport(id, project, promptName string, start tim
         EndTime:        end,
         DurationSeconds: end.Sub(start).Seconds(),
         Status:         status,
-        Errors:         errors,
+        Errors:         errorMessages,
         Warnings:       warnings,
         Logs:           logs,
     }

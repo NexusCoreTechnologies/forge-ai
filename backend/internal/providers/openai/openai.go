@@ -4,8 +4,11 @@ import (
     "bytes"
     "encoding/json"
     "errors"
+    "fmt"
+    "io"
     "net/http"
     "os"
+    "strings"
     "time"
 
     "forgeai/backend/internal/providers/interfaces"
@@ -17,6 +20,14 @@ type OpenAIProvider struct {
     apiKey string
     model  string
     client *http.Client
+}
+
+type QuotaError struct {
+    Code string
+}
+
+func (e *QuotaError) Error() string {
+    return "OpenAI API credits exhausted. Please add credits in the OpenAI Platform billing page."
 }
 
 func NewOpenAI(cfg *pmodels.Config) (interfaces.Provider, error) {
@@ -54,7 +65,18 @@ func (p *OpenAIProvider) Generate(prompt string) (*pmodels.Response, error) {
     }
     defer resp.Body.Close()
     if resp.StatusCode >= 400 {
-        return nil, errors.New("openai: non-OK response")
+        bodyBytes, readErr := io.ReadAll(resp.Body)
+        if readErr != nil {
+            return nil, fmt.Errorf("HTTP Status: %d\nResponse: <failed to read body>", resp.StatusCode)
+        }
+        bodyText := string(bodyBytes)
+        if bodyText == "" {
+            bodyText = "<empty body>"
+        }
+        if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(bodyText, "credit_balance_exhausted") {
+            return nil, &QuotaError{Code: "credit_balance_exhausted"}
+        }
+        return nil, fmt.Errorf("HTTP Status: %d\nResponse:\n%s", resp.StatusCode, bodyText)
     }
     var rr struct {
         Choices []struct {
@@ -62,6 +84,12 @@ func (p *OpenAIProvider) Generate(prompt string) (*pmodels.Response, error) {
                 Content string `json:"content"`
             } `json:"message"`
         } `json:"choices"`
+        Usage struct {
+            PromptTokens     int `json:"prompt_tokens"`
+            CompletionTokens int `json:"completion_tokens"`
+            TotalTokens      int `json:"total_tokens"`
+        } `json:"usage"`
+        Model string `json:"model"`
     }
     if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
         return nil, err
@@ -70,7 +98,11 @@ func (p *OpenAIProvider) Generate(prompt string) (*pmodels.Response, error) {
     if len(rr.Choices) > 0 {
         text = rr.Choices[0].Message.Content
     }
-    return &pmodels.Response{Text: text}, nil
+    res := &pmodels.Response{Text: text}
+    if rr.Usage.TotalTokens != 0 {
+        res.Tokens = rr.Usage.TotalTokens
+    }
+    return res, nil
 }
 
 func (p *OpenAIProvider) GenerateStream(prompt string) (<-chan string, error) {
@@ -87,8 +119,13 @@ func (p *OpenAIProvider) GenerateStream(prompt string) (<-chan string, error) {
 }
 
 func (p *OpenAIProvider) ListModels() ([]string, error) { return []string{p.model}, nil }
-func (p *OpenAIProvider) HealthCheck() error                       { return nil }
-func (p *OpenAIProvider) ValidateConfiguration() error             { return nil }
+func (p *OpenAIProvider) HealthCheck() error { return nil }
+func (p *OpenAIProvider) ValidateConfiguration() error {
+    if p.apiKey == "" {
+        return errors.New("openai: api key not configured")
+    }
+    return nil
+}
 func (p *OpenAIProvider) ProviderInfo() pmodels.Info {
     return pmodels.Info{Name: "openai", Version: "v1", Model: p.model}
 }
