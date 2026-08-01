@@ -69,16 +69,34 @@ func planSprintCmd() {
     lines, err := backlog.ReadBacklog(backlogPath)
     if err != nil {
         lg.Error("backlog.read.failed", map[string]any{"error": err.Error()})
-        return
+        fmt.Fprintln(os.Stderr, "error: could not read MASTER_BACKLOG.md - ensure the file exists in the workspace")
+        os.Exit(1)
     }
-    sprints := backlog.ParseSprints(lines)
-    selected := ""
-    if len(sprints) > 0 {
-        selected = sprints[0]
+    sprints, err := backlog.ParseBacklog(lines)
+    if err != nil {
+        lg.Error("backlog.parse.failed", map[string]any{"error": err.Error()})
+        fmt.Fprintln(os.Stderr, "error: could not parse backlog:", err.Error())
+        os.Exit(1)
     }
-    plan := &executionplan.Plan{SelectedSprint: selected, Tasks: []string{"task1", "task2"}}
-    _ = executionplan.WritePlan(filepath.Join(cfg.Workspace, "execution_plan.json"), plan)
-    lg.Info("plan.generated", map[string]any{"sprint": selected})
+    completed, pending := backlog.PartitionSprints(sprints)
+    if len(pending) == 0 {
+        lg.Info("planner.nothing_to_do", map[string]any{"completed": len(completed)})
+        fmt.Fprintln(os.Stderr, "no pending sprints found in MASTER_BACKLOG.md")
+        os.Exit(0)
+    }
+    selectedSprint := pending[0]
+    // Collect task texts for execution plan
+    tasks := []string{}
+    for _, t := range selectedSprint.Tasks {
+        tasks = append(tasks, t.Text)
+    }
+    plan := &executionplan.Plan{SelectedSprint: selectedSprint.Name, Tasks: tasks}
+    if err := executionplan.WritePlan(filepath.Join(cfg.Workspace, "execution_plan.json"), plan); err != nil {
+        lg.Error("plan.write.failed", map[string]any{"error": err.Error()})
+        fmt.Fprintln(os.Stderr, "error: failed to write execution_plan.json:", err.Error())
+        os.Exit(1)
+    }
+    lg.Info("plan.generated", map[string]any{"sprint": selectedSprint.Name, "tasks": len(tasks)})
 }
 
 // buildContextCmd builds an execution context for a workspace.
