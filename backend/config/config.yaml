@@ -1,0 +1,4 @@
+workspace: /Users/admin/Projects/forge-ai/test_workspace
+promptFolder: /Users/admin/Projects/forge-ai/prompts
+outputFolder: generated
+logFolder: logs
